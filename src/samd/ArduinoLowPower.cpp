@@ -2,6 +2,10 @@
 
 #include "ArduinoLowPower.h"
 
+ArduinoLowPowerClass::ArduinoLowPowerClass() : adc_cb(nullptr), sleep_count(0), wake_count(0), spurious_wake_count(0), last_wake_intflag(0), last_wake_wakeup(0) {
+	memset(wakeupSources, 0, sizeof(wakeupSources));
+}
+
 static void configGCLK6()
 {
 	// enable EIC clock
@@ -46,10 +50,204 @@ void ArduinoLowPowerClass::sleep() {
 	// Disable systick interrupt:  See https://www.avrfreaks.net/forum/samd21-samd21e16b-sporadically-locks-and-does-not-wake-standby-sleep-mode
 	SysTick->CTRL &= ~SysTick_CTRL_TICKINT_Msk;	
 	SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+
+#ifdef LOWPOWER_DEBUG_EIC
+	// Before sleeping, verify the Port Pin multiplexing is still routed to Peripheral A (EIC)
+	Serial.println("--- LOWPOWER DEBUG: Preparing for standby ---");
+	bool pmux_ok = true;
+	for (int i = 0; i < 16; i++) {
+		if (wakeupSources[i].active) {
+			uint32_t pin = wakeupSources[i].pin;
+			uint32_t port = g_APinDescription[pin].ulPort;
+			uint32_t pin_num = g_APinDescription[pin].ulPin;
+			uint32_t pmux_reg = PORT->Group[port].PMUX[pin_num >> 1].reg;
+			uint32_t pin_pcfg = PORT->Group[port].PINCFG[pin_num].reg;
+			uint32_t pmux_val = (pin_num & 1) ? (pmux_reg >> 4) : (pmux_reg & 0xF);
+			// Peripheral A is EIC (0)
+			bool is_pmux_peripheral_a = (pmux_val == 0) && (pin_pcfg & PORT_PINCFG_PMUXEN);
+			if (!is_pmux_peripheral_a) {
+				pmux_ok = false;
+				Serial.print("WARNING: Pin "); Serial.print(pin);
+				Serial.print(" (EXTINT"); Serial.print(i);
+				Serial.print(") is NOT configured for EIC multiplexing! PMUX="); Serial.print(pmux_val);
+				Serial.print(", PINCFG="); Serial.println(pin_pcfg, HEX);
+			}
+		}
+	}
+	if (pmux_ok) {
+		Serial.println("PMUX check passed: All active wake-source pins are routed to EIC.");
+	}
+#endif
+
+	// Increment sleep counter
+	sleep_count++;
+
+	// 1. Disable EIC to modify configurations safely
+	EIC->CTRL.bit.ENABLE = 0;
+	while (EIC->STATUS.bit.SYNCBUSY);
+
+	// 2. Clear EIC interrupt flags to prevent stale pending interrupts
+	EIC->INTFLAG.reg = EIC->INTFLAG.reg;
+
+	// 3. Rebuild EIC configuration for our registered wake sources
+	uint32_t config0 = EIC->CONFIG[0].reg;
+	uint32_t config1 = EIC->CONFIG[1].reg;
+	uint32_t wakeup_reg = EIC->WAKEUP.reg;
+	uint32_t intenset_reg = EIC->INTENSET.reg;
+
+	for (int i = 0; i < 16; i++) {
+		if (wakeupSources[i].active) {
+			uint32_t pos = (i < 8) ? (i << 2) : ((i - 8) << 2);
+			uint32_t sense_val = 0;
+			switch (wakeupSources[i].mode) {
+				#ifdef ARDUINO_API_VERSION
+				case PinStatus::LOW: sense_val = EIC_CONFIG_SENSE0_LOW_Val; break;
+				case PinStatus::HIGH: sense_val = EIC_CONFIG_SENSE0_HIGH_Val; break;
+				case PinStatus::CHANGE: sense_val = EIC_CONFIG_SENSE0_BOTH_Val; break;
+				case PinStatus::FALLING: sense_val = EIC_CONFIG_SENSE0_FALL_Val; break;
+				case PinStatus::RISING: sense_val = EIC_CONFIG_SENSE0_RISE_Val; break;
+				#else
+				case LOW: sense_val = EIC_CONFIG_SENSE0_LOW_Val; break;
+				case HIGH: sense_val = EIC_CONFIG_SENSE0_HIGH_Val; break;
+				case CHANGE: sense_val = EIC_CONFIG_SENSE0_BOTH_Val; break;
+				case FALLING: sense_val = EIC_CONFIG_SENSE0_FALL_Val; break;
+				case RISING: sense_val = EIC_CONFIG_SENSE0_RISE_Val; break;
+				#endif
+				default: sense_val = EIC_CONFIG_SENSE0_NONE_Val; break;
+			}
+
+			// Modify only the SENSE bits in the target CONFIG nibble (preserving other fields)
+			if (i < 8) {
+				config0 &= ~(EIC_CONFIG_SENSE0_Msk << pos);
+				config0 |= (sense_val << pos);
+				if (wakeupSources[i].filten) {
+					config0 |= (8 << pos); // Set FILTEN (bit 3 of nibble)
+				} else {
+					config0 &= ~(8 << pos); // Clear FILTEN
+				}
+			} else {
+				config1 &= ~(EIC_CONFIG_SENSE0_Msk << pos);
+				config1 |= (sense_val << pos);
+				if (wakeupSources[i].filten) {
+					config1 |= (8 << pos); // Set FILTEN
+				} else {
+					config1 &= ~(8 << pos); // Clear FILTEN
+				}
+			}
+
+			wakeup_reg |= (1 << i);
+			intenset_reg |= (1 << i);
+		}
+	}
+
+	// Write rebuilding EIC configurations and synchronize after each write
+	EIC->CONFIG[0].reg = config0;
+	while (EIC->STATUS.bit.SYNCBUSY);
+
+	EIC->CONFIG[1].reg = config1;
+	while (EIC->STATUS.bit.SYNCBUSY);
+
+	EIC->WAKEUP.reg = wakeup_reg;
+	while (EIC->STATUS.bit.SYNCBUSY);
+
+	EIC->INTENSET.reg = intenset_reg;
+	while (EIC->STATUS.bit.SYNCBUSY);
+
+	// 4. Re-enable EIC and synchronize
+	EIC->CTRL.bit.ENABLE = 1;
+	while (EIC->STATUS.bit.SYNCBUSY);
+
+	// Sanity check: Ensure EIC is enabled
+	if (EIC->CTRL.bit.ENABLE == 0) {
+		#ifdef LOWPOWER_DEBUG_EIC
+		Serial.println("CRITICAL ERROR: EIC failed to enable after synchronization!");
+		#endif
+	}
+
+#ifdef LOWPOWER_DEBUG_EIC
+	// Print active sources and register dump
+	for (int i = 0; i < 16; i++) {
+		if (wakeupSources[i].active) {
+			Serial.print("EXTINT"); Serial.print(i);
+			Serial.print(" (Pin "); Serial.print(wakeupSources[i].pin);
+			Serial.print(") -> Mode: ");
+			switch (wakeupSources[i].mode) {
+				#ifdef ARDUINO_API_VERSION
+				case PinStatus::LOW: Serial.print("LOW"); break;
+				case PinStatus::HIGH: Serial.print("HIGH"); break;
+				case PinStatus::CHANGE: Serial.print("CHANGE"); break;
+				case PinStatus::FALLING: Serial.print("FALLING"); break;
+				case PinStatus::RISING: Serial.print("RISING"); break;
+				#else
+				case LOW: Serial.print("LOW"); break;
+				case HIGH: Serial.print("HIGH"); break;
+				case CHANGE: Serial.print("CHANGE"); break;
+				case FALLING: Serial.print("FALLING"); break;
+				case RISING: Serial.print("RISING"); break;
+				#endif
+				default: Serial.print("UNKNOWN"); break;
+			}
+			if (wakeupSources[i].filten) {
+				Serial.print(" [FILTEN]");
+			}
+			Serial.println(" enabled");
+		}
+	}
+	Serial.println();
+	Serial.print("WAKEUP   = 0x"); Serial.println(EIC->WAKEUP.reg, HEX);
+	Serial.print("INTENSET = 0x"); Serial.println(EIC->INTENSET.reg, HEX);
+	Serial.print("INTFLAG  = 0x"); Serial.println(EIC->INTFLAG.reg, HEX);
+	Serial.print("CONFIG0  = 0x"); Serial.println(EIC->CONFIG[0].reg, HEX);
+	Serial.print("CONFIG1  = 0x"); Serial.println(EIC->CONFIG[1].reg, HEX);
+	Serial.println("Entering standby...");
+	Serial.flush();
+#endif
+
+	// 5. Clear NVIC pending interrupts for EIC
+	NVIC_ClearPendingIRQ(EIC_IRQn);
+
+	// Execute deep sleep
 	__DSB();
+	__ISB();
 	__WFI();
+
 	// Enable systick interrupt
 	SysTick->CTRL |= SysTick_CTRL_TICKINT_Msk;	
+
+	// Capture wake-up flags immediately after waking before they are altered
+	last_wake_intflag = EIC->INTFLAG.reg;
+	last_wake_wakeup = EIC->WAKEUP.reg;
+
+	// Increment wake counter
+	wake_count++;
+
+#ifdef LOWPOWER_DEBUG_EIC
+	Serial.println("--- LOWPOWER DEBUG: After wake ---");
+	Serial.print("INTFLAG = 0x"); Serial.println(last_wake_intflag, HEX);
+	Serial.print("WAKEUP  = 0x"); Serial.println(last_wake_wakeup, HEX);
+	
+	bool found_source = false;
+	for (int i = 0; i < 16; i++) {
+		if (last_wake_intflag & (1 << i)) {
+			Serial.print("Wake source detected: EXTINT"); Serial.print(i);
+			if (wakeupSources[i].active) {
+				Serial.print(" (Pin "); Serial.print(wakeupSources[i].pin); Serial.print(")");
+			}
+			Serial.println();
+			found_source = true;
+		}
+	}
+	if (!found_source) {
+		spurious_wake_count++;
+		Serial.println("Spurious or other wakeup source triggered wake (non-EIC).");
+	}
+	Serial.print("Stats: sleeps="); Serial.print(sleep_count);
+	Serial.print(", wakes="); Serial.print(wake_count);
+	Serial.print(", spurious_wakes="); Serial.println(spurious_wake_count);
+	Serial.println("------------------------------------");
+	Serial.flush();
+#endif
+
 	if (restoreUSBDevice) {
 		USBDevice.attach();
 	}
@@ -96,6 +294,21 @@ void ArduinoLowPowerClass::attachInterruptWakeup(uint32_t pin, voidFuncPtr callb
 	EExt_Interrupts in = g_APinDescription[pin].ulExtInt;
 	if (in == NOT_AN_INTERRUPT || in == EXTERNAL_INT_NMI)
     		return;
+
+	// Query existing FILTEN bit for this specific external interrupt channel
+	uint32_t config_idx = (in < 8) ? 0 : 1;
+	uint32_t pos = (in < 8) ? (in << 2) : ((in - 8) << 2);
+	bool current_filten = (EIC->CONFIG[config_idx].reg & (8 << pos)) != 0;
+
+	// Store in the software wake-source list
+	if (in < 16) {
+		wakeupSources[in].pin = pin;
+		wakeupSources[in].extint = in;
+		wakeupSources[in].mode = mode;
+		wakeupSources[in].callback = callback;
+		wakeupSources[in].filten = current_filten;
+		wakeupSources[in].active = true;
+	}
 
 	//pinMode(pin, INPUT_PULLUP);
 	attachInterrupt(pin, callback, mode);

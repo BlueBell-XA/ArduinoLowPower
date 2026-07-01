@@ -1,6 +1,9 @@
 #ifndef _ARDUINO_LOW_POWER_H_
 #define _ARDUINO_LOW_POWER_H_
 
+// Uncomment the following line to enable detailed EIC low-power standby debugging over Serial
+// #define LOWPOWER_DEBUG_EIC
+
 #include <Arduino.h>
 
 #ifdef ARDUINO_ARCH_AVR
@@ -47,6 +50,9 @@ enum adc_interrupt
 
 class ArduinoLowPowerClass {
 	public:
+		#ifdef ARDUINO_ARCH_SAMD
+		ArduinoLowPowerClass();
+		#endif
 		void idle(void);
 		void idle(uint32_t millis);
 		void idle(int millis) {
@@ -95,6 +101,22 @@ class ArduinoLowPowerClass {
 		RTCZero rtc;
 		voidFuncPtr adc_cb;
 		friend void ADC_Handler();
+
+		struct WakeupSource {
+			uint32_t pin;
+			uint32_t extint;
+			irq_mode mode;
+			voidFuncPtr callback;
+			bool active;
+			bool filten;
+		};
+		WakeupSource wakeupSources[16];
+
+		uint32_t sleep_count;
+		uint32_t wake_count;
+		uint32_t spurious_wake_count;
+		uint16_t last_wake_intflag;
+		uint16_t last_wake_wakeup;
 		#endif
 		#ifdef BOARD_HAS_COMPANION_CHIP
 		void (*companionSleepCB)(bool);
