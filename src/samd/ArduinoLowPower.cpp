@@ -438,7 +438,7 @@ void ArduinoLowPowerClass::detachAdcInterrupt()
 	while (ADC->STATUS.bit.SYNCBUSY) {}
 
 	// Disable ADC in standby mode
-	ADC->CTRLA.bit.RUNSTDBY = 1;
+	ADC->CTRLA.bit.RUNSTDBY = 0;
 	while (ADC->STATUS.bit.SYNCBUSY) {}
 
 	// Disable window interrupt
