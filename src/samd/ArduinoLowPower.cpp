@@ -300,6 +300,16 @@ void ArduinoLowPowerClass::attachInterruptWakeup(uint32_t pin, voidFuncPtr callb
 	uint32_t pos = (in < 8) ? (in << 2) : ((in - 8) << 2);
 	bool current_filten = (EIC->CONFIG[config_idx].reg & (8 << pos)) != 0;
 
+	// Validate EXTINT collision: warn if this channel is already owned by a different pin
+	if (in < 16 && wakeupSources[in].active && wakeupSources[in].pin != pin) {
+		#ifdef LOWPOWER_DEBUG_EIC
+		Serial.print("WARNING: EXTINT"); Serial.print(in);
+		Serial.print(" collision! Pin "); Serial.print(pin);
+		Serial.print(" is overwriting pin "); Serial.print(wakeupSources[in].pin);
+		Serial.println(" on the same EIC channel.");
+		#endif
+	}
+
 	// Store in the software wake-source list
 	if (in < 16) {
 		wakeupSources[in].pin = pin;
@@ -317,6 +327,40 @@ void ArduinoLowPowerClass::attachInterruptWakeup(uint32_t pin, voidFuncPtr callb
 
 	// Enable wakeup capability on pin in case being used during sleep
 	EIC->WAKEUP.reg |= (1 << in);
+}
+
+void ArduinoLowPowerClass::detachInterruptWakeup(uint32_t pin) {
+
+	if (pin > PINS_COUNT) {
+		// RTC alarm wakeup detach: disable the RTC alarm
+		switch (pin) {
+			case RTC_ALARM_WAKEUP:
+				rtc.disableAlarm();
+				break;
+		}
+		return;
+	}
+
+	EExt_Interrupts in = g_APinDescription[pin].ulExtInt;
+	if (in == NOT_AN_INTERRUPT || in == EXTERNAL_INT_NMI)
+		return;
+
+	// Clear the software wake-source registration
+	if (in < 16 && wakeupSources[in].active && wakeupSources[in].pin == pin) {
+		wakeupSources[in].active = false;
+		wakeupSources[in].callback = nullptr;
+
+		// Remove wakeup capability for this EXTINT channel
+		EIC->WAKEUP.reg &= ~(1 << in);
+
+		// Detach the Arduino-level interrupt handler
+		detachInterrupt(pin);
+
+		#ifdef LOWPOWER_DEBUG_EIC
+		Serial.print("Detached wakeup: Pin "); Serial.print(pin);
+		Serial.print(" (EXTINT"); Serial.print(in); Serial.println(")");
+		#endif
+	}
 }
 
 void ArduinoLowPowerClass::attachAdcInterrupt(uint32_t pin, voidFuncPtr callback, adc_interrupt mode, uint16_t lo, uint16_t hi)
